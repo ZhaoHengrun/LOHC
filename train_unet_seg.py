@@ -19,7 +19,7 @@ parser.add_argument("--dataset_seg", default='datasets/train/AHP/seg/', type=str
 parser.add_argument("--dataset_img", default='datasets/train/AHP/img/', type=str, help="dataset path")
 parser.add_argument("--checkpoints_path", default='checkpoints/UNet_seg/', type=str,
                     help="checkpoints path")
-parser.add_argument("--resume", default='checkpoints/UNet_seg/last_model.pth', type=str,
+parser.add_argument("--resume", default='', type=str,
                     help="path to latest checkpoint (default: none)")
 parser.add_argument("--batchSize", type=int, default=48, help="training batch size")
 parser.add_argument("--nEpochs", type=int, default=2000, help="number of epochs to train for")

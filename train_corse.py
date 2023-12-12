@@ -15,7 +15,7 @@ import torch
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--start_epoch", type=int, default=1, help="epoch to start training from")
-parser.add_argument("--resume", default='checkpoints/mae_gan_2/last_model.pth', type=str, help="path to latest checkpoint (default: none)")
+parser.add_argument("--resume", default='', type=str, help="path to latest checkpoint (default: none)")
 parser.add_argument("--n_epochs", type=int, default=1000, help="number of epochs of training")
 # parser.add_argument("--dataset_seg", default='/home/zhr/Project/UNet_Human_Seg/datasets/train/seg/', type=str, help="dataset path")
 parser.add_argument("--dataset_img", default='datasets/train/AHP/img/', type=str, help="dataset path")
