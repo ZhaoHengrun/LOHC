@@ -1,0 +1,296 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+# --------------------------------------------------------
+# References:
+# timm: https://github.com/rwightman/pytorch-image-models/tree/master/timm
+# DeiT: https://github.com/facebookresearch/deit
+# --------------------------------------------------------
+
+from functools import partial
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.vision_transformer import PatchEmbed, Block
+from einops import rearrange
+
+from util.pos_embed import get_2d_sincos_pos_embed
+
+
+def run_mae_inference(model_mae, images_masked, mask):
+    with torch.no_grad():
+        reconstruction_loss, pred, mask = model_mae(images_masked, mask, threshold=0)
+    return pred
+
+
+class MaskedAutoencoderViT(nn.Module):
+    """ Masked Autoencoder with VisionTransformer backbone
+    """
+
+    def __init__(self, img_size=32, patch_size=16, in_chans=3,
+                 embed_dim=1024, depth=24, num_heads=16,
+                 decoder_embed_dim=128, decoder_depth=2, decoder_num_heads=16,
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
+        super().__init__()
+
+        # --------------------------------------------------------------------------
+        # MAE encoder specifics
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim), requires_grad=False)  # fixed sin-cos embedding
+
+        self.blocks = nn.ModuleList([
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            for i in range(depth)])
+        self.norm = norm_layer(embed_dim)
+
+        self.human_blocks = nn.ModuleList([
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            for i in range(depth)])
+        self.norm = norm_layer(embed_dim)
+
+        self.patch_embed_human = PatchEmbed(img_size, patch_size, 3, embed_dim)
+
+        # --------------------------------------------------------------------------
+
+        # --------------------------------------------------------------------------
+        # MAE decoder specifics
+        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim // 2, bias=True)
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim // 2))
+
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_embed_dim // 2), requires_grad=False)  # fixed sin-cos embedding  [4, 257, 128]
+        # self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1 + num_patches, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
+
+        self.decoder_blocks = nn.ModuleList([
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            for i in range(decoder_depth)])
+
+        self.decoder_norm = norm_layer(decoder_embed_dim)
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size ** 2 * in_chans, bias=True)  # decoder to patch
+        # --------------------------------------------------------------------------
+
+        self.norm_pix_loss = norm_pix_loss
+
+        self.initialize_weights()
+        self.in_chans = in_chans
+
+    def initialize_weights(self):
+        # initialization
+        # initialize (and freeze) pos_embed by sin-cos embedding
+        # pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.patch_embed.num_patches ** .5), cls_token=True)
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.patch_embed.num_patches ** .5), cls_token=False)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        decoder_pos_embed = get_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1], int(self.patch_embed.num_patches ** .5), cls_token=False)
+        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+
+        # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
+        w = self.patch_embed.proj.weight.data
+        torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+
+        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
+        # torch.nn.init.normal_(self.cls_token, std=.02)
+        torch.nn.init.normal_(self.mask_token, std=.02)
+
+        # initialize nn.Linear and nn.LayerNorm
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def patchify(self, imgs):
+        """
+        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 *3)
+        """
+        p = self.patch_embed.patch_size[0]
+        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
+
+        h = w = imgs.shape[2] // p
+        x = imgs.reshape(shape=(imgs.shape[0], self.in_chans, h, p, w, p))
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, p ** 2 * self.in_chans))
+        return x
+
+    def unpatchify(self, x):
+        """
+        x: (N, L, patch_size**2 *3)
+        imgs: (N, 3, H, W)
+        """
+        p = self.patch_embed.patch_size[0]
+        h = w = int(x.shape[1] ** .5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, self.in_chans))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], self.in_chans, h * p, h * p))
+        return imgs
+
+    def unpatchify_mask(self, x):
+        """
+        x: (N, L, patch_size**2 *3)
+        imgs: (N, 3, H, W)
+        """
+        h = w = int(x.shape[1] ** .5)
+        assert h * w == x.shape[1]
+
+        x = x.unsqueeze(-1)
+        x = x.reshape(shape=(x.shape[0], h, w, 1, 1, 1))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], 1, h * 1, h * 1))
+        return imgs
+
+    def random_masking(self, x, human, mask_ratio):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        """
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - mask_ratio))
+
+        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        human_masked = torch.gather(human, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_masked, human_masked, mask, ids_restore
+
+    def mask_masking(self, x, human, mask, threshold=0):
+        N, L, D = x.shape  # [b, h*w, p*q*c]
+
+        mask = rearrange(mask, 'b c (patch_num_h patch_size_h) (patch_num_w patch_size_w) -> b (patch_num_h patch_num_w) (patch_size_h patch_size_w c)',
+                         patch_size_h=self.patch_embed.patch_size[0], patch_size_w=self.patch_embed.patch_size[1])
+        binary_mask = (mask.mean(-1) > threshold).float()
+        mask_num = int(binary_mask.sum(-1)[0].item())
+
+        ids_shuffle = torch.argsort(binary_mask, dim=1)  # ascend: small is keep, large is remove   [b, 256]
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        ids_keep = ids_shuffle[:, :L - mask_num]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        human_masked = torch.gather(human, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        mae_mask = torch.ones([N, L], device=x.device)
+        mae_mask[:, :L - mask_num] = 0
+        mae_mask = torch.gather(mae_mask, dim=1, index=ids_restore)
+        assert (mae_mask == binary_mask).all()
+        return x_masked, human_masked, mae_mask, ids_restore
+
+    def forward_encoder(self, x, human, mask, threshold=0):
+        # embed patches
+        x = self.patch_embed(x)  # [b, 256, 128]
+        human = self.patch_embed(human)  # [b, 256, 128]
+
+        # add pos embed w/o cls token
+        x = x + self.pos_embed
+        human = human + self.pos_embed
+
+        # masking: length -> length * mask_ratio
+        x, human, mask, ids_restore = self.mask_masking(x, human, mask, threshold=threshold)  # x:[b, 25, 128], mask:[b, 256], ids_restore:[b, 256]
+
+        # apply Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)  # normal:[4, 26, 128] -> [4, 282, 128]
+
+        for blk in self.human_blocks:
+            human = blk(human)
+        human = self.norm(human)
+        return x, human, mask, ids_restore
+
+    def forward_decoder(self, x, human, ids_restore):
+        # embed tokens
+        x = self.decoder_embed(x)  # [4, 26, 128] -> [4, 282, 128]
+
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] - x.shape[1], 1)  # [4, 231, 128]
+        x_ = torch.cat([x, mask_tokens], dim=1)  # no cls token   [4, 256, 128]
+        human_ = torch.cat([human, mask_tokens], dim=1)  # no cls token   [4, 256, 128]
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle [4, 256, 128]
+        human_ = torch.gather(human_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle [4, 256, 128]
+
+        # add pos embed
+        x = x_ + self.decoder_pos_embed  # [4, 256, 128]
+        human = human_ + self.decoder_pos_embed  # [4, 256, 128]
+
+        # add human pred
+        x = torch.cat([x, human], dim=-1)  # [4, 256, dim]
+
+        # apply Transformer blocks
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+
+        # predictor projection
+        x = self.decoder_pred(x)  # [b, 512, 128] -> [b, 512, 48]
+
+        return x
+
+
+    def forward(self, img_with_seg, human_with_seg, mask, threshold=0):
+        latent, human, mask, ids_restore = self.forward_encoder(img_with_seg, human_with_seg, mask, threshold)
+        pred = self.forward_decoder(latent, human, ids_restore)  # [N, L, p*p*3]
+        pred = self.unpatchify(pred).float()
+        return pred, mask
+
+
+def mae_vit_base_patch4_dec128d32b(**kwargs):
+    model = MaskedAutoencoderViT(
+        patch_size=4, embed_dim=128, depth=32, num_heads=16,
+        decoder_embed_dim=256, decoder_depth=32, decoder_num_heads=16,
+        mlp_ratio=4, in_chans=4, img_size=64, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
+def mae_vit_base_patch1_dec8d32b(**kwargs):
+    model = MaskedAutoencoderViT(
+        patch_size=1, embed_dim=128, depth=32, num_heads=16,
+        decoder_embed_dim=128, decoder_depth=32, decoder_num_heads=16,
+        mlp_ratio=4, in_chans=64, img_size=16, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
+def mae_vit_large_patch16_dec512d8b(**kwargs):
+    model = MaskedAutoencoderViT(
+        patch_size=4, embed_dim=1024, depth=24, num_heads=16,
+        decoder_embed_dim=1024, decoder_depth=24, decoder_num_heads=16,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
+def mae_vit_huge_patch14_dec512d8b(**kwargs):
+    model = MaskedAutoencoderViT(
+        patch_size=14, embed_dim=1280, depth=32, num_heads=16,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
+# set recommended archs
+mae_vit_base_patch4 = mae_vit_base_patch4_dec128d32b  # decoder: 512 dim, 8 blocks
+mae_vit_base_patch1 = mae_vit_base_patch1_dec8d32b
+mae_vit_large_patch16 = mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
+mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks
