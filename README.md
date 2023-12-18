@@ -1,4 +1,4 @@
-# Large Occluded Human Image Completion
+# [AAAI 2024] Large Occluded Human Image Completion via Image-Prior Cooperating
 
 ## Requirements
 
