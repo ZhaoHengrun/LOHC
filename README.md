@@ -27,5 +27,5 @@ Move all images with the word ```test``` in the file name to ```dataset/test/```
 3. Train the refinement network ```python train_refinement.py```
 4. Train the segmentation network ```python train_unet_seg.py```
 ## Test
-1. We provided a trained weight:https://drive.google.com/file/d/1cns3WYNf0lKQytzDOi2BlQF8P7WdhCsb/view?usp=sharing
+1. We provided a trained weight:```https://drive.google.com/file/d/1cns3WYNf0lKQytzDOi2BlQF8P7WdhCsb/view?usp=sharing``` and a trained UNet:```https://drive.google.com/file/d/1TQ5jmvqoMVPtZ42Dlxc6UkOiLxCUhOFm/view?usp=sharing```
 2. Test ```python test.py```
